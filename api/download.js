@@ -2,7 +2,7 @@ import axios from 'axios';
 import * as cheerio from 'cheerio';
 
 // ==========================================
-// FORMATTERS
+// FORMATTERS & URL NORMALIZERS
 // ==========================================
 
 function formatNumber(num) {
@@ -36,6 +36,25 @@ function parseRegion(locationCreated) {
   return regionMap[locationCreated] || locationCreated || 'Unknown';
 }
 
+/**
+ * Converts relative paths (/video/media/...) into absolute HTTPS URLs
+ * so Android DownloadManager does not crash with "Can only download HTTP/HTTPS URIs".
+ */
+function ensureAbsoluteUrl(mediaUrl) {
+  if (!mediaUrl || typeof mediaUrl !== 'string') return '';
+  const trimmed = mediaUrl.trim();
+  if (trimmed.startsWith('http://') || trimmed.startsWith('https://')) {
+    return trimmed;
+  }
+  if (trimmed.startsWith('//')) {
+    return 'https:' + trimmed;
+  }
+  if (trimmed.startsWith('/')) {
+    return 'https://www.tikwm.com' + trimmed;
+  }
+  return trimmed;
+}
+
 // ==========================================
 // URL SANITIZATION & REDIRECT RESOLVER
 // ==========================================
@@ -49,14 +68,13 @@ const USER_AGENTS = [
 function cleanInputUrl(rawInput) {
   if (!rawInput) return '';
 
-  // Extract pure URL if user pasted with title/text
   const match = rawInput.match(/https?:\/\/[^\s]+/i);
   let url = match ? match[0] : rawInput.trim();
 
   try {
     const parsed = new URL(url);
 
-    // If it's a direct web link (/@user/video/12345...), strip tracking query parameters
+    // Strip tracking parameters (?_r=1&...) from standard /video/ links
     if (parsed.pathname.includes('/video/')) {
       return `${parsed.origin}${parsed.pathname}`;
     }
@@ -71,7 +89,6 @@ function cleanInputUrl(rawInput) {
 }
 
 async function resolveRedirectUrl(shortUrl) {
-  // If it already has /video/, no redirect resolution needed
   if (shortUrl.includes('/video/')) return shortUrl;
 
   try {
@@ -81,7 +98,7 @@ async function resolveRedirectUrl(shortUrl) {
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
         'Accept-Language': 'en-US,en;q=0.9',
       },
-      timeout: 6000, // Short timeout to avoid Vercel limit
+      timeout: 6000,
       maxRedirects: 5,
       validateStatus: (status) => status >= 200 && status < 400,
     });
@@ -112,7 +129,7 @@ function extractNumericId(url) {
 // EXTRACTION STRATEGIES
 // ==========================================
 
-// Strategy 1: TikWM Gateway (Best for short links and avoiding datacenter blocks)
+// Strategy 1: TikWM Gateway
 async function fetchFromTikWm(targetUrl) {
   try {
     const response = await axios.post(
@@ -138,18 +155,25 @@ async function fetchFromTikWm(targetUrl) {
       const item = result.data;
       const isImages = Array.isArray(item.images) && item.images.length > 0;
 
+      const playUrl = ensureAbsoluteUrl(item.play);
+      const hdPlayUrl = ensureAbsoluteUrl(item.hdplay);
+      const wmPlayUrl = ensureAbsoluteUrl(item.wmplay);
+      const musicUrl = ensureAbsoluteUrl(item.music || item.music_info?.play);
+      const avatarUrl = ensureAbsoluteUrl(item.author?.avatar);
+      const coverUrl = ensureAbsoluteUrl(item.cover);
+
       const uniqueQualities = [];
-      if (item.play) {
+      if (playUrl) {
         uniqueQualities.push({
-          url: item.play,
+          url: playUrl,
           quality: 'Normal',
           size: item.size ? formatBytes(item.size) : 'Unknown',
           sizeBytes: item.size || 0,
         });
       }
-      if (item.hdplay && item.hdplay !== item.play) {
+      if (hdPlayUrl && hdPlayUrl !== playUrl) {
         uniqueQualities.unshift({
-          url: item.hdplay,
+          url: hdPlayUrl,
           quality: 'HD',
           size: item.hd_size ? formatBytes(item.hd_size) : 'Unknown',
           sizeBytes: item.hd_size || 0,
@@ -162,11 +186,11 @@ async function fetchFromTikWm(targetUrl) {
           type: isImages ? 'images' : 'video',
           id: item.id || '',
           desc: item.title || '',
-          thumbnail: item.cover || '',
+          thumbnail: coverUrl,
           author: {
             name: item.author?.nickname || '',
             username: item.author?.unique_id || '',
-            avatar: item.author?.avatar || '',
+            avatar: avatarUrl,
             verified: false,
           },
           statistics: {
@@ -183,12 +207,12 @@ async function fetchFromTikWm(targetUrl) {
           region: parseRegion(item.region || 'Unknown'),
           createdAt: item.create_time ? new Date(item.create_time * 1000).toISOString() : new Date().toISOString(),
           video: {
-            hd: item.hdplay || item.play || null,
+            hd: hdPlayUrl || playUrl || null,
             noWatermark: uniqueQualities,
-            withWatermark: item.wmplay
+            withWatermark: wmPlayUrl
               ? [
                   {
-                    url: item.wmplay,
+                    url: wmPlayUrl,
                     quality: 'Watermarked',
                     size: item.wm_size ? formatBytes(item.wm_size) : 'Unknown',
                     sizeBytes: item.wm_size || 0,
@@ -196,12 +220,12 @@ async function fetchFromTikWm(targetUrl) {
                 ]
               : [],
           },
-          images: isImages ? item.images.map((img) => ({ url: img, width: 1080, height: 1920 })) : [],
+          images: isImages ? item.images.map((img) => ({ url: ensureAbsoluteUrl(img), width: 1080, height: 1920 })) : [],
           music: {
             title: item.music_info?.title || 'Original Sound',
             author: item.music_info?.author || '',
-            cover: item.music_info?.cover || '',
-            url: item.music || item.music_info?.play || '',
+            cover: ensureAbsoluteUrl(item.music_info?.cover),
+            url: musicUrl,
             duration: item.music_info?.duration || 0,
           },
         },
@@ -213,7 +237,7 @@ async function fetchFromTikWm(targetUrl) {
   return null;
 }
 
-// Strategy 2: Direct Official Aweme API (via Numeric ID)
+// Strategy 2: Official Aweme Endpoint
 async function fetchFromApi(numericVideoId) {
   if (!numericVideoId) return null;
 
@@ -304,9 +328,10 @@ function formatItemStruct(itemStruct) {
 
   if (videoInfo.play_addr?.url_list?.length > 0) {
     videoInfo.play_addr.url_list.forEach((u) => {
-      if (u) {
+      const absUrl = ensureAbsoluteUrl(u);
+      if (absUrl) {
         noWmQualities.push({
-          url: u,
+          url: absUrl,
           quality: 'Normal',
           size: 'Unknown',
           sizeBytes: 0,
@@ -317,9 +342,10 @@ function formatItemStruct(itemStruct) {
 
   if (Array.isArray(videoInfo.bit_rate)) {
     videoInfo.bit_rate.forEach((info) => {
-      if (info.play_addr?.url_list?.[0]) {
+      const absUrl = ensureAbsoluteUrl(info.play_addr?.url_list?.[0]);
+      if (absUrl) {
         noWmQualities.push({
-          url: info.play_addr.url_list[0],
+          url: absUrl,
           quality: `${info.width}x${info.height}` || 'HD',
           size: formatBytes(info.data_size || 0),
           sizeBytes: info.data_size || 0,
@@ -331,9 +357,10 @@ function formatItemStruct(itemStruct) {
   const withWatermark = [];
   if (videoInfo.download_addr?.url_list?.length > 0) {
     videoInfo.download_addr.url_list.forEach((u) => {
-      if (u) {
+      const absUrl = ensureAbsoluteUrl(u);
+      if (absUrl) {
         withWatermark.push({
-          url: u,
+          url: absUrl,
           quality: 'Watermarked',
           size: 'Unknown',
           sizeBytes: 0,
@@ -349,21 +376,31 @@ function formatItemStruct(itemStruct) {
     return true;
   });
 
+  const rawCover =
+    videoInfo.cover?.url_list?.[0] ||
+    videoInfo.origin_cover?.url_list?.[0] ||
+    videoInfo.cover ||
+    '';
+  const rawAvatar =
+    authorInfo.avatar_thumb?.url_list?.[0] ||
+    authorInfo.avatar_larger?.url_list?.[0] ||
+    '';
+  const rawMusic =
+    musicInfo.play_url?.url_list?.[0] ||
+    musicInfo.play_url?.uri ||
+    '';
+
   return {
     status: 'success',
     data: {
       type: isImagePost ? 'images' : 'video',
       id: itemStruct.aweme_id || itemStruct.id || '',
       desc: itemStruct.desc || '',
-      thumbnail:
-        videoInfo.cover?.url_list?.[0] ||
-        videoInfo.origin_cover?.url_list?.[0] ||
-        videoInfo.cover ||
-        '',
+      thumbnail: ensureAbsoluteUrl(rawCover),
       author: {
         name: authorInfo.nickname || '',
         username: authorInfo.unique_id || authorInfo.uniqueId || '',
-        avatar: authorInfo.avatar_thumb?.url_list?.[0] || authorInfo.avatar_larger?.url_list?.[0] || '',
+        avatar: ensureAbsoluteUrl(rawAvatar),
         verified: authorInfo.verification_type === 1 || authorInfo.is_verified || false,
       },
       statistics: {
@@ -382,13 +419,13 @@ function formatItemStruct(itemStruct) {
         ? new Date(itemStruct.create_time * 1000).toISOString()
         : new Date().toISOString(),
       video: {
-        hd: dedupedNoWm[0]?.url || videoInfo.play_addr?.url_list?.[0] || null,
+        hd: dedupedNoWm[0]?.url || ensureAbsoluteUrl(videoInfo.play_addr?.url_list?.[0]) || null,
         noWatermark: dedupedNoWm,
         withWatermark: withWatermark,
       },
       images: isImagePost
         ? (itemStruct.imagePost?.images || itemStruct.image_post_info?.images || []).map((img) => ({
-            url: img.url_list?.[0] || img.display_image?.url_list?.[0] || '',
+            url: ensureAbsoluteUrl(img.url_list?.[0] || img.display_image?.url_list?.[0] || ''),
             width: img.width || 1080,
             height: img.height || 1920,
           }))
@@ -396,8 +433,8 @@ function formatItemStruct(itemStruct) {
       music: {
         title: musicInfo.title || '',
         author: musicInfo.author || '',
-        cover: musicInfo.cover_large?.url_list?.[0] || '',
-        url: musicInfo.play_url?.url_list?.[0] || '',
+        cover: ensureAbsoluteUrl(musicInfo.cover_large?.url_list?.[0] || ''),
+        url: ensureAbsoluteUrl(rawMusic),
         duration: Math.floor((musicInfo.duration || 0) / 1000),
       },
     },
@@ -433,7 +470,7 @@ export default async function handler(req, res) {
       return res.status(400).json({ status: 'error', message: 'Invalid URL. Must be a TikTok link.' });
     }
 
-    // Step 2: Resolve short links (vt.tiktok.com) to find true video link
+    // Step 2: Resolve short links (vt.tiktok.com / vm.tiktok.com)
     const resolvedUrl = await resolveRedirectUrl(cleaned);
     const numericId = extractNumericId(resolvedUrl) || extractNumericId(cleaned);
 
@@ -442,7 +479,7 @@ export default async function handler(req, res) {
     // Strategy 1: TikWM proxy
     result = await fetchFromTikWm(resolvedUrl);
 
-    // Strategy 2: Official aweme endpoint (via ID)
+    // Strategy 2: Official aweme endpoint (via numeric ID)
     if (!result && numericId) {
       result = await fetchFromApi(numericId);
     }
@@ -466,4 +503,5 @@ export default async function handler(req, res) {
       message: error.message || 'Internal extraction failure.',
     });
   }
-}
+    }
+        
